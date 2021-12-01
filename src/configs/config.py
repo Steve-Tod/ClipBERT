@@ -325,6 +325,8 @@ class SharedConfigs(object):
             help="scaler of the intermediate linear layer dimension for mlp classifier")
         self.parser.add_argument("--num_labels", type=int, default=3129,
                                  help="#labels/output-dim for classifier")
+        # DDP
+        self.parser.add_argument("--local_rank", type=int, default=-1)
         return self.parse_args()
 
     def get_video_qa_args(self):
@@ -343,7 +345,6 @@ class SharedConfigs(object):
         # for frameQA msrvtt_qa
         self.parser.add_argument("--ans2label_path", type=str, default=None,
                                  help="path to {answer: label} file")
-
         # manually setup config by task type
         args = self.parse_args()
         if args.max_n_example_per_group != 1:

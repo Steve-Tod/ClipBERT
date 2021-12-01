@@ -33,7 +33,7 @@ from os.path import join, exists
 from easydict import EasyDict as edict
 from apex import amp
 from torch.utils.data.distributed import DistributedSampler
-import horovod.torch as hvd
+import torch.distributed as dist
 from src.utils.distributed import all_gather_list
 from collections import defaultdict
 
@@ -107,7 +107,7 @@ def mk_video_ret_dataloader(anno_path, lmdb_dir, cfg, tokenizer, is_train=True):
     else:
         batch_size = cfg.train_batch_size if is_train else cfg.val_batch_size
     sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank(),
+        dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
         shuffle=is_train)
     vqa_collator = VideoRetrievalCollator(
         tokenizer=tokenizer, max_length=cfg.max_txt_len)
@@ -144,7 +144,7 @@ def mk_video_ret_eval_dataloader(anno_path, lmdb_dir, cfg, tokenizer):
         ensemble_n_clips=cfg.inference_n_clips,
     )
     sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank(),
+        dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
         shuffle=False)
     retrieval_collator = VideoRetrievalCollator(
         tokenizer=tokenizer, max_length=cfg.max_txt_len)
@@ -265,7 +265,7 @@ def validate(model, val_loader, eval_loader, cfg, train_global_step, eval_filepa
 
     model.train()
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         # average loss for each example
         acc = float(n_corrects / n_ex)
         val_log = {'valid/loss': float(loss / n_ex), 'valid/acc': acc}
@@ -280,15 +280,15 @@ def validate(model, val_loader, eval_loader, cfg, train_global_step, eval_filepa
 def start_training(cfg):
     set_random_seed(cfg.seed)
 
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     cfg.n_gpu = n_gpu
     device = torch.device("cuda", hvd.local_rank())
     torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), bool(cfg.fp16)))
+                    device, n_gpu, dist.get_rank(), bool(cfg.fp16)))
 
     model = setup_model(cfg, device=device)
     model.train()
@@ -335,7 +335,7 @@ def start_training(cfg):
     restorer = TrainingRestorer(cfg, model, optimizer)
     global_step = restorer.global_step
     TB_LOGGER.global_step = global_step
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         LOGGER.info("Saving training meta...")
         save_training_meta(cfg)
         path = join(
@@ -632,7 +632,7 @@ def inference_retrieval(model, val_loader, eval_file_path, cfg):
     st = time.time()
     eval_bsz = cfg.inference_batch_size if cfg.do_inference else cfg.eval_retrieval_batch_size
     LOGGER.info(f"Evaluate retrieval #video per GPU: {len(val_loader)}")
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         pbar = tqdm(total=len(val_loader), desc="eval")
 
     for batch in val_loader:
@@ -687,14 +687,14 @@ def inference_retrieval(model, val_loader, eval_file_path, cfg):
                     score=round(score, 4)
                 ))
 
-        if hvd.rank() == 0:
+        if dist.get_rank() == 0:
             pbar.update(1)
 
     # ###### Saving with Horovod ####################
     # dummy sync
     _ = None
     all_gather_list(_)
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     eval_dir = join(cfg.output_dir, f"results_{os.path.splitext(os.path.basename(eval_file_path))[0]}")
     os.makedirs(eval_dir, exist_ok=True)
     if n_gpu > 1:
@@ -706,7 +706,7 @@ def inference_retrieval(model, val_loader, eval_file_path, cfg):
                 LOGGER.info(f"Save results trial NO. {save_trial}")
                 save_json(
                     retrieval_res,
-                    join(eval_dir, f"tmp_results_rank{hvd.rank()}.json"))
+                    join(eval_dir, f"tmp_results_rank{dist.get_rank()}.json"))
                 break
             except Exception as e:
                 print(f"Saving exception: {e}")
@@ -716,14 +716,14 @@ def inference_retrieval(model, val_loader, eval_file_path, cfg):
     _ = None
     all_gather_list(_)
     # join results
-    if n_gpu > 1 and hvd.rank() == 0:
+    if n_gpu > 1 and dist.get_rank() == 0:
         retrieval_res = []
         for rk in range(n_gpu):
             retrieval_res.extend(load_json(
                 join(eval_dir, f"tmp_results_rank{rk}.json")))
         LOGGER.info('results joined')
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         retrieval_metrics = eval_retrieval(
             retrieval_res, val_loader.dataset.gt_cap_id2vid_id, val_loader.dataset.id2data)
         LOGGER.info(f"validation finished in {int(time.time() - st)} seconds. scores: {retrieval_metrics}")
@@ -736,10 +736,10 @@ def inference_retrieval(model, val_loader, eval_file_path, cfg):
 
 def start_inference(cfg):
     set_random_seed(cfg.seed)
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     device = torch.device("cuda", hvd.local_rank())
     torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
 
     inference_res_dir = join(
@@ -748,14 +748,14 @@ def start_inference(cfg):
         f"step_{cfg.inference_model_step}_{cfg.inference_n_clips}_{cfg.score_agg_func}"
     )
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         os.makedirs(inference_res_dir, exist_ok=True)
         save_json(cfg, join(inference_res_dir, "raw_args.json"),
                   save_pretty=True)
 
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), bool(cfg.fp16)))
+                    device, n_gpu, dist.get_rank(), bool(cfg.fp16)))
 
     # overwrite cfg with stored_cfg,
     # but skip keys containing the keyword 'inference'
@@ -804,7 +804,7 @@ def start_inference(cfg):
     ret_results, ret_scores = inference_retrieval(
         model, val_loader, cfg.inference_txt_db, cfg)
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         save_json(cfg, join(inference_res_dir, "merged_args.json"),
                   save_pretty=True)
         save_json(ret_results, join(inference_res_dir, "results.json"),

@@ -27,7 +27,7 @@ from tqdm import tqdm
 from os.path import join
 from apex import amp
 from torch.utils.data.distributed import DistributedSampler
-import horovod.torch as hvd
+import torch.distributed as dist
 from src.utils.distributed import all_gather_list
 
 
@@ -113,7 +113,7 @@ def mk_captions_pretrain_dataloader(
     # so that video input image size could be similar to image batch size.
     batch_size = batch_size if vis_format == "image" else int(batch_size / cfg.num_frm)
     sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank(),
+        dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
         shuffle=is_train)
     data_collator = PretrainCollator(tokenizer=tokenizer,
                                      mlm=cfg.use_mlm,
@@ -277,13 +277,13 @@ def start_training():
     cfg = shared_configs.get_pretraining_args()
     set_random_seed(cfg.seed)
 
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     device = torch.device("cuda", hvd.local_rank())
     torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
     LOGGER.info(f"device: {device} n_gpu: {n_gpu}, "
-                f"rank: {hvd.rank()}, 16-bits training: {cfg.fp16}")
+                f"rank: {dist.get_rank()}, 16-bits training: {cfg.fp16}")
 
     model = setup_model(cfg, device=device)
     model.train()
@@ -333,7 +333,7 @@ def start_training():
     restorer = TrainingRestorer(cfg, model, optimizer)
     global_step = restorer.global_step
     TB_LOGGER.global_step = global_step
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         LOGGER.info("Saving training meta...")
         save_training_meta(cfg)
         path = join(

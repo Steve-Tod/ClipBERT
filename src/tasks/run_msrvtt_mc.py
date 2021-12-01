@@ -24,7 +24,7 @@ from os.path import join
 from easydict import EasyDict as edict
 from apex import amp
 from torch.utils.data.distributed import DistributedSampler
-import horovod.torch as hvd
+import torch.distributed as dist
 from src.utils.distributed import all_gather_list
 
 
@@ -79,7 +79,7 @@ def mk_msrvtt_mc_eval_dataloader(anno_path, lmdb_dir, cfg, tokenizer):
         ensemble_n_clips=cfg.inference_n_clips,
     )
     sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank(),
+        dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
         shuffle=False)
     collator = MSRVTTMCCollator(
         tokenizer=tokenizer, max_length=cfg.max_txt_len)
@@ -148,7 +148,7 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
     pred_id2ans = dict()
     st = time.time()
     LOGGER.info(f"Evaluate retrieval MC: {len(val_loader)}")
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         pbar = tqdm(total=len(val_loader), desc="eval")
 
     for batch in val_loader:
@@ -196,14 +196,14 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
         for qid, pred_ans in zip(question_ids, pred_answers):
             pred_id2ans[qid] = int(pred_ans)
 
-        if hvd.rank() == 0:
+        if dist.get_rank() == 0:
             pbar.update(1)
 
     # ###### Saving with Horovod ####################
     # dummy sync
     _ = None
     all_gather_list(_)
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     eval_dir = join(cfg.output_dir, f"results_mc_{os.path.splitext(os.path.basename(eval_file_path))[0]}")
     os.makedirs(eval_dir, exist_ok=True)
     if n_gpu > 1:
@@ -215,7 +215,7 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
                 LOGGER.info(f"Save results trial NO. {save_trial}")
                 save_json(
                     pred_id2ans,
-                    join(eval_dir, f"tmp_results_mc_rank{hvd.rank()}.json"))
+                    join(eval_dir, f"tmp_results_mc_rank{dist.get_rank()}.json"))
                 break
             except Exception as e:
                 print(f"Saving exception: {e}")
@@ -225,7 +225,7 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
     _ = None
     all_gather_list(_)
     # join results
-    if n_gpu > 1 and hvd.rank() == 0:
+    if n_gpu > 1 and dist.get_rank() == 0:
         pred_id2ans = []
         for rk in range(n_gpu):
             pred_id2ans.append(load_json(
@@ -233,7 +233,7 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
         pred_id2ans = merge_dicts(pred_id2ans)
         LOGGER.info('results joined')
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         retrieval_qa_metrics = val_loader.dataset.evaluate_qa_accuracy(pred_id2ans, force_same=True)
         LOGGER.info(f"validation finished in {int(time.time() - st)} seconds. scores: {retrieval_qa_metrics}")
     else:
@@ -245,10 +245,10 @@ def inference_retrieval_mc(model, val_loader, eval_file_path, cfg, n_options=5):
 
 def start_inference(cfg):
     set_random_seed(cfg.seed)
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     device = torch.device("cuda", hvd.local_rank())
     torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
 
     inference_res_dir = join(
@@ -257,14 +257,14 @@ def start_inference(cfg):
         f"step_{cfg.inference_model_step}_{cfg.inference_n_clips}_{cfg.score_agg_func}"
     )
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         os.makedirs(inference_res_dir, exist_ok=True)
         save_json(cfg, join(inference_res_dir, "raw_args.json"),
                   save_pretty=True)
 
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), bool(cfg.fp16)))
+                    device, n_gpu, dist.get_rank(), bool(cfg.fp16)))
 
     # overwrite cfg with stored_cfg,
     # but skip keys containing the keyword 'inference'
@@ -306,7 +306,7 @@ def start_inference(cfg):
     ret_results, ret_scores = inference_retrieval_mc(
         model, val_loader, cfg.inference_txt_db, cfg)
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         save_json(cfg, join(inference_res_dir, "merged_args.json"),
                   save_pretty=True)
         save_json(ret_results, join(inference_res_dir, "mc_test_results.json"),

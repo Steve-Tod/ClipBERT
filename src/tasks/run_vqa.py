@@ -3,6 +3,7 @@ import os
 import time
 import random
 import math
+from torch.nn.parallel.distributed import DistributedDataParallel
 from transformers import BertConfig, BertTokenizerFast
 from src.modeling.modeling import ClipBertForSequenceClassification
 from src.modeling.e2e_model import ClipBert
@@ -30,8 +31,9 @@ from os.path import join, exists
 from easydict import EasyDict as edict
 from apex import amp
 from torch.utils.data.distributed import DistributedSampler
-import horovod.torch as hvd
-from src.utils.distributed import all_gather_list
+import torch.distributed as dist
+from src.utils.distributed_torch import dist_init, dist_destroy, dist_barrier, gather_scalar, all_gather
+from torch.nn.parallel import DistributedDataParallel as DDP
 from collections import defaultdict
 
 
@@ -92,7 +94,7 @@ def mk_vqa_dataloader(anno_path, img_lmdb_dir, cfg, tokenizer, is_train=True):
     else:
         batch_size = cfg.train_batch_size if is_train else cfg.val_batch_size
     sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank(),
+        dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
         shuffle=is_train)
     vqa_collator = VQACollator(tokenizer=tokenizer,
                                max_length=cfg.max_txt_len)
@@ -156,8 +158,8 @@ def setup_model(cfg, device=None):
         model.freeze_cnn_backbone()    
 
     model.to(device)
-
     LOGGER.info("Setup model done!")
+
     return model
 
 
@@ -191,15 +193,21 @@ def validate(model, val_loader, cfg, train_global_step, eval_score=True):
                 question_id=qid,
                 answer=val_loader.dataset.label2ans[pred_label]
             ))
-
         if cfg.debug and val_step >= debug_step:
             break
 
     if cfg.debug:
         LOGGER.info(vqa_results[:10])
-    n_ex_per_rank = all_gather_list(n_ex)
-    loss = sum(all_gather_list(loss))
-    n_ex = sum(all_gather_list(n_ex))
+    # n_ex_per_rank = gather_scalar(n_ex, dtype=outputs["loss"].dtype, device=outputs["loss"].device)
+    # loss_per_rank = gather_scalar(loss, dtype=outputs["loss"].dtype, device=outputs["loss"].device)
+    # loss = sum(loss_per_rank).item()
+    # n_ex = sum(n_ex_per_rank).item()
+
+    n_ex_per_rank = all_gather(n_ex)
+    loss_per_rank = all_gather(loss)
+    loss = sum(loss_per_rank)
+    n_ex = sum(n_ex_per_rank)
+
     val_log = {'valid/loss': float(loss / n_ex)}
     if eval_score:
         LOGGER.info(f"Evaluate VQA scores for {len(vqa_results)} vqa_results,"
@@ -207,7 +215,7 @@ def validate(model, val_loader, cfg, train_global_step, eval_score=True):
         vqa_scores = val_loader.dataset.evaluate_vqa(vqa_results)
 
         # Gather scores
-        scores_per_rank = all_gather_list(vqa_scores)
+        scores_per_rank = all_gather(vqa_scores)
         gathered_scores = {}
         gathered_ratios = {
             k: [0, 0] for k, _ in scores_per_rank[0]["ratios"].items()}
@@ -260,34 +268,25 @@ def validate(model, val_loader, cfg, train_global_step, eval_score=True):
 def start_training(cfg):
     set_random_seed(cfg.seed)
 
-    n_gpu = hvd.size()
+    n_gpu = dist.get_world_size()
     cfg.n_gpu = n_gpu
-    device = torch.device("cuda", hvd.local_rank())
-    torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    device = torch.device("cuda", dist.get_rank())
+    torch.cuda.set_device(dist.get_rank())
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), bool(cfg.fp16)))
+                    device, n_gpu, dist.get_rank(), bool(cfg.fp16)))
 
     model = setup_model(cfg, device=device)
     model.train()
     optimizer = setup_e2e_optimizer(model, cfg)
 
-    # Horovod: (optional) compression algorithm.compressin
-    compression = hvd.Compression.none
-    optimizer = hvd.DistributedOptimizer(
-        optimizer, named_parameters=model.named_parameters(),
-        compression=compression)
-
-    #  Horovod: broadcast parameters & optimizer state.
-    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
-
     model, optimizer = amp.initialize(
         model, optimizer, enabled=cfg.fp16, opt_level='O2',
         keep_batchnorm_fp32=True)
 
+    model = DDP(model, device_ids=[dist.get_rank()], output_device=dist.get_rank(), find_unused_parameters=True)
     # prepare data
     tokenizer = BertTokenizerFast.from_pretrained(cfg.tokenizer_dir)
     train_loader, val_loader = setup_dataloaders(cfg, tokenizer)
@@ -304,18 +303,21 @@ def start_training(cfg):
         cfg.min_valid_steps)) * cfg.min_valid_steps
     actual_num_valid = int(math.floor(
         1. * cfg.num_train_steps / cfg.valid_steps)) + 1
-
+    
     # restore
     restorer = TrainingRestorer(cfg, model, optimizer)
     global_step = restorer.global_step
     TB_LOGGER.global_step = global_step
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         LOGGER.info("Saving training meta...")
         save_training_meta(cfg)
         path = join(
             cfg.output_dir, 'log', "detectron2_model_cfg.yaml")
         with open(path, "w") as f:
-            f.write(model.cnn.config_file)
+            if isinstance(model, DistributedDataParallel):
+                f.write(model.module.cnn.config_file)
+            else:
+                f.write(model.cnn.config_file)
         LOGGER.info("Saving training done...")
         TB_LOGGER.create(join(cfg.output_dir, 'log'))
         model_saver = ModelSaver(join(cfg.output_dir, "ckpt"))
@@ -343,10 +345,10 @@ def start_training(cfg):
     LOGGER.info(f"  Validate every {cfg.valid_steps} steps, in total {actual_num_valid} times")
 
     # quick hack for amp delay_unscale bug
-    with optimizer.skip_synchronize():
-        optimizer.zero_grad()
-        if global_step == 0:
-            optimizer.step()
+    # with optimizer.skip_synchronize():
+    optimizer.zero_grad()
+    if global_step == 0:
+        optimizer.step()
     debug_step = 3
     running_loss = RunningMeter('train_loss')
     for step, batch in enumerate(InfiniteIterator(train_loader)):
@@ -362,7 +364,7 @@ def start_training(cfg):
                 ) as scaled_loss:
             scaled_loss.backward()
             zero_none_grad(model)
-            optimizer.synchronize()
+            #optimizer.synchronize()
 
         # optimizer
         if (step + 1) % cfg.gradient_accumulation_steps == 0:
@@ -418,9 +420,9 @@ def start_training(cfg):
 
             assert len(none_grads) == 0, f"{none_grads}"
 
-            with optimizer.skip_synchronize():
-                optimizer.step()
-                optimizer.zero_grad()
+            #with optimizer.skip_synchronize():
+            optimizer.step()
+            optimizer.zero_grad()
             restorer.step()
             pbar.update(1)
 
@@ -445,23 +447,23 @@ def start_training(cfg):
 
 def start_inference(cfg):
     set_random_seed(cfg.seed)
-    n_gpu = hvd.size()
-    device = torch.device("cuda", hvd.local_rank())
-    torch.cuda.set_device(hvd.local_rank())
-    if hvd.rank() != 0:
+    n_gpu = dist.get_world_size()
+    device = torch.device("cuda", dist.get_rank())
+    torch.cuda.set_device(dist.get_rank())
+    if dist.get_rank() != 0:
         LOGGER.disabled = True
 
     inference_res_dir = join(
         cfg.output_dir, f"results_{cfg.inference_split}"
         f"step_{cfg.inference_model_step}")
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         os.makedirs(inference_res_dir, exist_ok=True)
         save_json(cfg, join(inference_res_dir, "raw_args.json"),
                   save_pretty=True)
 
     LOGGER.info("device: {} n_gpu: {}, rank: {}, "
                 "16-bits training: {}".format(
-                    device, n_gpu, hvd.rank(), bool(cfg.fp16)))
+                    device, n_gpu, dist.get_rank(), bool(cfg.fp16)))
 
     # overwrite cfg with stored_cfg,
     # but skip keys containing the keyword 'inference'
@@ -519,14 +521,13 @@ def start_inference(cfg):
         model, val_loader, cfg, global_step,
         eval_score=cfg.inference_split == "val")
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         save_json(cfg, join(inference_res_dir, "merged_args.json"),
                   save_pretty=True)
 
     # ###### Saving with Horovod ####################
     # dummy sync
-    _ = None
-    all_gather_list(_)
+    dist_barrier()
     if n_gpu > 1:
         # with retrial, as azure blob fails occasionally.
         max_save_load_trial = 10
@@ -536,22 +537,21 @@ def start_inference(cfg):
                 LOGGER.info(f"Save results trial NO. {save_trial}")
                 save_json(
                     vqa_results,
-                    join(inference_res_dir, f"results_rank{hvd.rank()}.json"))
+                    join(inference_res_dir, f"results_rank{dist.get_rank()}.json"))
                 break
             except Exception:
                 save_trial += 1
     # dummy sync
-    _ = None
-    all_gather_list(_)
+    dist_barrier()
     # join results
-    if n_gpu > 1 and hvd.rank() == 0:
+    if n_gpu > 1 and dist.get_rank() == 0:
         vqa_results = []
         for rk in range(n_gpu):
             vqa_results.extend(load_json(
                 join(inference_res_dir, f"results_rank{rk}.json")))
         LOGGER.info('results joined')
 
-    if hvd.rank() == 0:
+    if dist.get_rank() == 0:
         save_json(
             vqa_results,
             join(inference_res_dir, "results_all.json"))
@@ -560,9 +560,12 @@ def start_inference(cfg):
 
 if __name__ == '__main__':
     # Initialize Horovod
-    hvd.init()
+    
     input_cfg = shared_configs.get_vqa_args()
+    dist_init(input_cfg.local_rank)
+
     if input_cfg.do_inference:
         start_inference(input_cfg)
     else:
         start_training(input_cfg)
+    dist_destroy()

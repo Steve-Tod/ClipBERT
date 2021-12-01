@@ -59,127 +59,7 @@ We use mixed-precision training hence GPUs with Tensor Cores are recommended.
     For your convenience, this script will also download `bert-base-uncased` and `grid-feat-vqa` 
     model weights, which are used as initialization for pretraining.  
 
-3. Launch the Docker container for running the experiments.
-    ```bash
-    # docker image should be automatically pulled
-    source launch_container.sh $PATH_TO_STORAGE/txt_db $PATH_TO_STORAGE/vis_db \
-        $PATH_TO_STORAGE/finetune $PATH_TO_STORAGE/pretrained
-    ```
-    The launch script respects $CUDA_VISIBLE_DEVICES environment variable.
-    Note that the source code is mounted into the container under `/clipbert` instead 
-    of built into the image so that user modification will be reflected without
-    re-building the image. (Data folders are mounted into the container separately
-    for flexibility on folder structures.)
-
 ### Downstream Task Finetuning
-
-#### Text-to-Video Retrieval
-
-Tasks: MSRVTT retrieval, DiDeMo and ActivityNet Captions paragprah-to-video retrieval, MSRVTT MC Test.
-
-1. Download data.
-    ```bash
-    # outside the container  
-    # download videos + annotations for $DSET
-    bash scripts/download_$DSET.sh $PATH_TO_STORAGE
-    ```
-    `$DSET` can be one of `msrvtt`, `didemo`, `anet`.
-
-2. Finetuning. 
-    ```bash
-    # inside the container
-    horovodrun -np 4 python src/tasks/run_video_retrieval.py \
-        --config $CONFIG_PATH \
-        --output_dir $OUTPUT_DIR
-   
-    # for single GPU
-    python src/tasks/run_video_retrieval.py \
-        --config $CONFIG_PATH \
-        --output_dir $OUTPUT_DIR
-    ```
-    `$CONFIG_PATH` should be set to one of the .json config files available at [src/configs](src/configs) 
-    prefixed with `_ret`. For example, you can use `src/configs/msrvtt_ret_base_resnet50.json` 
-    for MSRVTT retrieval.
-    
-3. Run inference.
-    ```bash
-    # inside the container
-    horovodrun -np 4 python src/tasks/run_video_retrieval.py \
-      --do_inference 1 --output_dir $OUTPUT_DIR \
-      --inference_split val --inference_model_step $STEP \
-      --inference_txt_db $TXT_DB \
-      --inference_img_db $IMG_DB --inference_batch_size 64 \
-      --inference_n_clips $INFERENCE_N_CLIPS
-    ```
-   `$STEP` is an integer, it tells the script to use the checkpoint 
-   `$OUTPUT_DIR/ckpt/model_step_$STEP.pt` for inference.
-   `$TXT_DB` and `$IMG_DB` are path to annotation file and video data. You can use
-   `TXT_DB=/txt/downstream/msrvtt_retrieval/msrvtt_retrieval_val.jsonl` and 
-   `IMG_DB=/img/msrvtt` for inference on MSRVTT retrieval val split.
-    The results will be written under `$OUTPUT_DIR`. You can use different `$INFERENCE_N_CLIPS` 
-    for inference, such as 1 or 16. Using more clips will have a large impact 
-    on inference speed and memory usage. You may want to use smaller batch sizes if larger 
-    values are set.
-    
-    After MSRVTT retrieval model is trained, you can use it for inference 
-    for the MSRVTT MC Test task as well, which is essentially a retrieval 
-    task in a multiple-choice task setup. 
-    ```bash
-    # inside the container
-    horovodrun -np 4 python src/tasks/run_msrvtt_mc.py \
-      --do_inference 1 --output_dir $OUTPUT_DIR \
-      --inference_split val --inference_model_step $STEP \
-      --inference_txt_db /txt/downstream/msrvtt_retrieval_mc/msrvtt_retrieval_mc_test.jsonl \
-      --inference_img_db /img/msrvtt --inference_batch_size 64 \
-      --inference_n_clips $INFERENCE_N_CLIPS
-    ```    
-   
-   
-#### Video Question Answering
-
-Tasks: TGIF-QA action, transition, and frameQA tasks; MSRVTT-QA. 
-
-1. Download data.
-    ```bash
-    # outside the container  
-    # download MSRVTT videos, and QA + retrieval annotations
-    bash scripts/download_msrvtt.sh $PATH_TO_STORAGE  
-    # download TGIF-QA videos and annotations
-    bash scripts/download_tgif_qa.sh $PATH_TO_STORAGE  
-    ```
-
-2. Finetuning. 
-    ```bash
-    # inside the container
-    horovodrun -np 4 python src/tasks/run_video_qa.py \
-        --config $CONFIG_PATH \
-        --output_dir $OUTPUT_DIR
-    ```
-    `$CONFIG_PATH` should be set to one of the .json config files available at [src/configs](src/configs) 
-    contains the substring `_qa`. For example, you can use `src/configs/msrvtt_qa_base_resnet50.json` 
-    for MSRVTT-QA.
-
-3. Run inference.
-    ```bash
-    # inside the container
-    horovodrun -np 4 python src/tasks/run_video_qa.py \
-      --do_inference 1 --output_dir $OUTPUT_DIR \
-      --inference_split val --inference_model_step $STEP \
-      --inference_txt_db $TXT_DB \
-      --inference_img_db $IMG_DB --inference_batch_size 64 \
-      --inference_n_clips $INFERENCE_N_CLIPS
-    ```
-   `$STEP` is an integer, which tells the script to use the checkpoint 
-   `$OUTPUT_DIR/ckpt/model_step_$STEP.pt` for inference.
-   `$TXT_DB` and `$IMG_DB` are path to annotation file and video data. You can use
-   `TXT_DB=/txt/downstream/msrvtt_retrieval/msrvtt_qa_val.jsonl` and 
-   `IMG_DB=/img/msrvtt` for inference on MSRVTT QA val split.
-   
-    The results will be written under `$OUTPUT_DIR`. You can use different `$INFERENCE_N_CLIPS` 
-    for inference, such as 1 or 16. Using more clips will have a large impact 
-    on inference speed and memory usage. You may want to use smaller batch sizes if larger 
-    values are set.
-
 
 #### Image Question Answering (VQA)
 1. Download data
@@ -194,7 +74,7 @@ Tasks: TGIF-QA action, transition, and frameQA tasks; MSRVTT-QA.
 2. Finetuning
     ```bash
     # inside the container
-    horovodrun -np 4 python src/tasks/run_vqa.py \
+    PYTHONPATH=. python -m torch.distributed.launch --nproc_per_node=4 src/tasks/run_vqa.py \
         --config src/configs/vqa_base_resnet50.json \
         --output_dir $OUTPUT_DIR
     ```
@@ -202,7 +82,7 @@ Tasks: TGIF-QA action, transition, and frameQA tasks; MSRVTT-QA.
 3. Inference
     ```bash
     # inside the container
-    horovodrun -np 4 python src/tasks/run_vqa.py \
+    PYTHONPATH=. python python -m torch.distributed.launch --nproc_per_node=4 src/tasks/run_vqa.py \
       --do_inference 1 --output_dir $OUTPUT_DIR \
       --inference_split val --inference_model_step $STEP \
       --inference_txt_db $TXT_DB \

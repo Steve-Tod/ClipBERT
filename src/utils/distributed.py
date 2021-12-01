@@ -147,7 +147,7 @@ def broadcast_tensors(tensors, root_rank, buffer_size=10485760):
 
 def all_gather_list(data, max_size=4096):
     """Gathers arbitrary data from all nodes into a list."""
-    world_size = hvd.size()
+    world_size = dist.get_world_size()
     if not hasattr(all_gather_list, '_in_buffer') or \
             max_size != all_gather_list._in_buffer.size():
         all_gather_list._in_buffer = torch.cuda.ByteTensor(max_size)
