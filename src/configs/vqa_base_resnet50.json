@@ -29,7 +29,7 @@
   "tokenizer_dir": "/scratch/cluster/zhenyu/projects/clipbert_data/pretrained/bert-base-uncased/",
   "output_dir": "/scratch/cluster/zhenyu/projects/clipbert_data/storage/vqa_default",
   "train_batch_size": 32,
-  "val_batch_size": 16,
+  "val_batch_size": 8,
   "gradient_accumulation_steps": 1,
   "num_train_epochs": 5,
   "min_valid_steps": 100,

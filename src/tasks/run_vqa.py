@@ -115,6 +115,8 @@ def setup_dataloaders(cfg, tokenizer):
         img_lmdb_dir=cfg.train_datasets[0].img,
         cfg=cfg, tokenizer=tokenizer, is_train=True
     )
+    # val loader 0, workers
+    cfg.n_workers = 0
     val_loader = mk_vqa_dataloader(
         anno_path=cfg.val_datasets[0].txt,
         img_lmdb_dir=cfg.val_datasets[0].img,
