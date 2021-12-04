@@ -59,6 +59,26 @@ We use mixed-precision training hence GPUs with Tensor Cores are recommended.
     For your convenience, this script will also download `bert-base-uncased` and `grid-feat-vqa` 
     model weights, which are used as initialization for pretraining.  
 
+3. Install required packages
+
+```bash
+cd docker
+pip install -r requirements.txt
+pip install torch==1.5.1+cu101 torchvision==0.6.1+cu101 -f https://download.pytorch.org/whl/torch_stable.html
+# apex
+git clone https://github.com/NVIDIA/apex.git &&\
+    cd apex &&\
+    git reset --hard 3fe10b5597ba14a748ebb271a6ab97c09c5701ac &&\
+    pip install -v --no-cache-dir --global-option="--cpp_ext" --global-option="--cuda_ext" . &&\
+    rm -rf ../apex
+# detectron
+pip install 'git+https://github.com/facebookresearch/fvcore'
+python -m pip install 'git+https://github.com/facebookresearch/detectron2.git@ffff8ac'
+# use the faster pillow-simd instead of the original pillow
+pip uninstall pillow && \
+CC="cc -mavx2" pip install -U --force-reinstall pillow-simd
+```
+
 ### Downstream Task Finetuning
 
 #### Image Question Answering (VQA)
