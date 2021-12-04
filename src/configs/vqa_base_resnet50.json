@@ -2,15 +2,15 @@
   "train_datasets": [
     {
       "name": "vqa",
-      "txt": ["/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vqa_k_trainval.jsonl",
-              "/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vg_k_trainval.jsonl"],
+      "txt": ["/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vqa_k_trainval_w_tag.jsonl",
+              "/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vg_k_trainval_w_tag.jsonl"],
       "img": "/scratch/cluster/zhenyu/projects/clipbert_data/vis_db/coco_train2014_val2014"
     }
   ],
   "val_datasets": [
     {
       "name": "vqa",
-      "txt": "/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vqa_k_test.jsonl",
+      "txt": "/scratch/cluster/zhenyu/projects/clipbert_data/txt_db/vqa/vqa_k_test_w_tag.jsonl",
       "img": "/scratch/cluster/zhenyu/projects/clipbert_data/vis_db/coco_train2014_val2014"
     }
   ],
