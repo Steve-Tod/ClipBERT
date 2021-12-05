@@ -337,6 +337,9 @@ def start_training(cfg):
     if global_step > 0:
         pbar.update(global_step)
 
+    num_epoch = 1.0 * (cfg.num_train_steps - global_step) / len(train_loader)
+    num_epoch = int(math.ceil(num_epoch))
+    
     LOGGER.info(cfg)
     LOGGER.info("Starting training...")
     LOGGER.info(f"***** Running training with {n_gpu} GPUs *****")
@@ -348,6 +351,7 @@ def start_training(cfg):
     LOGGER.info(f"  Total #epochs = {cfg.num_train_epochs}")
     LOGGER.info(f"  Total #steps = {cfg.num_train_steps}")
     LOGGER.info(f"  Validate every {cfg.valid_steps} steps, in total {actual_num_valid} times")
+    LOGGER.info(f"  Left #epochs = {num_epoch}")
 
     # quick hack for amp delay_unscale bug
     # with optimizer.skip_synchronize():
@@ -356,93 +360,96 @@ def start_training(cfg):
         optimizer.step()
     debug_step = 3
     running_loss = RunningMeter('train_loss')
-    for step, batch in enumerate(InfiniteIterator(train_loader)):
-        # forward pass
-        outputs, question_ids = forward_step(model, batch)
-        loss = outputs["loss"].mean()
-        loss = loss.float() * cfg.num_labels
-        running_loss(loss.item())
-        # backward pass
-        delay_unscale = (step + 1) % cfg.gradient_accumulation_steps != 0
-        with amp.scale_loss(
-                loss, optimizer, delay_unscale=delay_unscale
-                ) as scaled_loss:
-            scaled_loss.backward()
-            zero_none_grad(model)
-            #optimizer.synchronize()
-        # if dist.get_rank() == 0:
-        #     print(loss.item(), scaled_loss.item())
-        # optimizer
-        if (step + 1) % cfg.gradient_accumulation_steps == 0:
-            global_step += 1
-            TB_LOGGER.add_scalar('train/loss', running_loss.val, global_step)
+    
+    for epoch in range(num_epoch):
+        LOGGER.info(f"Epoch {epoch} starts")
+        for step, batch in enumerate(train_loader):
+            # forward pass
+            outputs, question_ids = forward_step(model, batch)
+            loss = outputs["loss"].mean()
+            loss = loss.float() * cfg.num_labels
+            running_loss(loss.item())
+            # backward pass
+            delay_unscale = (step + 1) % cfg.gradient_accumulation_steps != 0
+            with amp.scale_loss(
+                    loss, optimizer, delay_unscale=delay_unscale
+                    ) as scaled_loss:
+                scaled_loss.backward()
+                zero_none_grad(model)
+                #optimizer.synchronize()
+            # if dist.get_rank() == 0:
+            #     print(loss.item(), scaled_loss.item())
+            # optimizer
+            if (step + 1) % cfg.gradient_accumulation_steps == 0:
+                global_step += 1
+                TB_LOGGER.add_scalar('train/loss', running_loss.val, global_step)
 
-            n_epoch = int(1. * total_train_batch_size * global_step
-                          / total_n_examples)
-            # learning rate scheduling transformer
-            lr_this_step_transformer = get_lr_sched(
-                global_step, cfg.decay, cfg.learning_rate,
-                cfg.num_train_steps, warmup_ratio=cfg.warmup_ratio,
-                decay_epochs=cfg.step_decay_epochs, multi_step_epoch=n_epoch)
+                n_epoch = int(1. * total_train_batch_size * global_step
+                            / total_n_examples)
+                # learning rate scheduling transformer
+                lr_this_step_transformer = get_lr_sched(
+                    global_step, cfg.decay, cfg.learning_rate,
+                    cfg.num_train_steps, warmup_ratio=cfg.warmup_ratio,
+                    decay_epochs=cfg.step_decay_epochs, multi_step_epoch=n_epoch)
 
-            # learning rate scheduling cnn
-            lr_this_step_cnn = get_lr_sched(
-                global_step, cfg.cnn_lr_decay, cfg.cnn_learning_rate,
-                cfg.num_train_steps, warmup_ratio=cfg.warmup_ratio,
-                decay_epochs=cfg.cnn_step_decay_epochs,
-                multi_step_epoch=n_epoch)
+                # learning rate scheduling cnn
+                lr_this_step_cnn = get_lr_sched(
+                    global_step, cfg.cnn_lr_decay, cfg.cnn_learning_rate,
+                    cfg.num_train_steps, warmup_ratio=cfg.warmup_ratio,
+                    decay_epochs=cfg.cnn_step_decay_epochs,
+                    multi_step_epoch=n_epoch)
 
-            # Hardcoded param group length
-            assert len(optimizer.param_groups) == 8
-            for pg_n, param_group in enumerate(
-                    optimizer.param_groups):
-                if pg_n in [0, 1]:
-                    param_group['lr'] = (
-                        cfg.transformer_lr_mul * lr_this_step_transformer)
-                elif pg_n in [2, 3]:
-                    param_group['lr'] = lr_this_step_transformer
-                elif pg_n in [4, 5]:
-                    param_group['lr'] = (
-                        cfg.cnn_lr_mul * lr_this_step_cnn)
-                else:
-                    param_group['lr'] = lr_this_step_cnn
-            TB_LOGGER.add_scalar(
-                "train/lr_transformer", lr_this_step_transformer,
-                global_step)
-            TB_LOGGER.add_scalar(
-                "train/lr_cnn", lr_this_step_cnn, global_step)
+                # Hardcoded param group length
+                assert len(optimizer.param_groups) == 8
+                for pg_n, param_group in enumerate(
+                        optimizer.param_groups):
+                    if pg_n in [0, 1]:
+                        param_group['lr'] = (
+                            cfg.transformer_lr_mul * lr_this_step_transformer)
+                    elif pg_n in [2, 3]:
+                        param_group['lr'] = lr_this_step_transformer
+                    elif pg_n in [4, 5]:
+                        param_group['lr'] = (
+                            cfg.cnn_lr_mul * lr_this_step_cnn)
+                    else:
+                        param_group['lr'] = lr_this_step_cnn
+                TB_LOGGER.add_scalar(
+                    "train/lr_transformer", lr_this_step_transformer,
+                    global_step)
+                TB_LOGGER.add_scalar(
+                    "train/lr_cnn", lr_this_step_cnn, global_step)
 
-            # update model params
-            if cfg.grad_norm != -1:
-                grad_norm = clip_grad_norm_(
-                    amp.master_params(optimizer), cfg.grad_norm)
-                TB_LOGGER.add_scalar("train/grad_norm", grad_norm, global_step)
-            TB_LOGGER.step()
+                # update model params
+                if cfg.grad_norm != -1:
+                    grad_norm = clip_grad_norm_(
+                        amp.master_params(optimizer), cfg.grad_norm)
+                    TB_LOGGER.add_scalar("train/grad_norm", grad_norm, global_step)
+                TB_LOGGER.step()
 
-            # Check if there is None grad
-            none_grads = [
-                p[0] for p in model.named_parameters()
-                if p[1].requires_grad and p[1].grad is None]
+                # Check if there is None grad
+                none_grads = [
+                    p[0] for p in model.named_parameters()
+                    if p[1].requires_grad and p[1].grad is None]
 
-            assert len(none_grads) == 0, f"{none_grads}"
+                assert len(none_grads) == 0, f"{none_grads}"
 
-            #with optimizer.skip_synchronize():
-            optimizer.step()
-            optimizer.zero_grad()
-            restorer.step()
-            pbar.update(1)
+                #with optimizer.skip_synchronize():
+                optimizer.step()
+                optimizer.zero_grad()
+                restorer.step()
+                pbar.update(1)
 
-            # checkpoint
-            if global_step % cfg.valid_steps == 0:
-                LOGGER.info(f'Step {global_step}: start validation')
-                vqa_results = validate(
-                    model, val_loader, cfg, global_step)
-                model_saver.save(step=global_step, model=model)
-        if global_step >= cfg.num_train_steps:
-            break
+                # checkpoint
+                if global_step % cfg.valid_steps == 0:
+                    LOGGER.info(f'Step {global_step}: start validation')
+                    vqa_results = validate(
+                        model, val_loader, cfg, global_step)
+                    model_saver.save(step=global_step, model=model)
+            if global_step >= cfg.num_train_steps:
+                break
 
-        if cfg.debug and global_step >= debug_step:
-            break
+            if cfg.debug and global_step >= debug_step:
+                break
 
     if global_step % cfg.valid_steps != 0:
         LOGGER.info(f'Step {global_step}: start validation')
